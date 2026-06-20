@@ -5,6 +5,8 @@ for Windows, powered by the Hy-MT2-1.8B Large Language Model in GGUF format. It
 provides a clean, intuitive interface inspired by Google Translate, allowing for
 high-quality local translation without relying on expensive cloud APIs.
 
+<img width="897" height="580" alt="image" src="https://github.com/user-attachments/assets/7f8ad72e-5f6d-47b7-937d-ce76c08ccf50" />
+
 ✨ Key Features
 
   - 🚀 High Performance: Optimized for local execution using the Hy-MT2-1.8B
