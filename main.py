@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from PySide6.QtGui import QCloseEvent
+from PySide6.QtCore import QMimeData
 from PySide6.QtGui import QBrush, QColor, QFont, QPalette
 from PySide6.QtCore import Qt, QSize, QPoint, QTimer, QThread, Signal
 
@@ -67,52 +68,49 @@ def save_config(data: dict) -> None:
 
 
 # ── model variants from HuggingFace ────────────────────────
+# tencent/Hy-MT2-1.8B-GGUF & tencent/Hy-MT2-7B-GGUF
 MODEL_VARIANTS = [
-    ("2-bit", [
-        ("UD-IQ2_M", "723 MB"),
-        ("UD-Q2_K_XL", "804 MB"),
+    ("1.8B — 4-bit", [
+        ("1.8B/Q4_K_M", "1.13 GB"),
     ]),
-    ("3-bit", [
-        ("UD-IQ3_XXS", "787 MB"),
-        ("Q3_K_S", "872 MB"),
-        ("Q3_K_M", "951 MB"),
-        ("UD-Q3_K_XL", "990 MB"),
+    ("1.8B — 6-bit", [
+        ("1.8B/Q6_K", "1.47 GB"),
     ]),
-    ("4-bit", [
-        ("IQ4_XS", "1.03 GB"),
-        ("Q4_K_S", "1.08 GB"),
-        ("IQ4_NL", "1.08 GB"),
-        ("Q4_0", "1.08 GB"),
-        ("Q4_1", "1.17 GB"),
-        ("Q4_K_M", "1.13 GB"),
-        ("UD-Q4_K_XL", "1.17 GB"),
+    ("1.8B — 8-bit", [
+        ("1.8B/Q8_0", "1.91 GB"),
     ]),
-    ("5-bit", [
-        ("Q5_K_S", "1.27 GB"),
-        ("Q5_K_M", "1.30 GB"),
-        ("UD-Q5_K_XL", "1.30 GB"),
+    ("7B — 4-bit", [
+        ("7B/Q4_K_M", "4.62 GB"),
     ]),
-    ("6-bit", [
-        ("Q6_K", "1.47 GB"),
-        ("UD-Q6_K_XL", "1.64 GB"),
+    ("7B — 6-bit", [
+        ("7B/Q6_K", "6.16 GB"),
     ]),
-    ("8-bit", [
-        ("Q8_0", "1.91 GB"),
-        ("UD-Q8_K_XL", "2.40 GB"),
-    ]),
-    ("16-bit", [
-        ("BF16", "3.59 GB"),
+    ("7B — 8-bit", [
+        ("7B/Q8_0", "7.98 GB"),
     ]),
 ]
 
 
 # ── HuggingFace helpers ────────────────────────────────────
-HF_REPO = "unsloth/Hy-MT2-1.8B-GGUF"
 HF_URL_BASE = "https://huggingface.co"
 
+HF_MODEL_REPO_URLS = {
+    "1.8B": "tencent/Hy-MT2-1.8B-GGUF",
+    "7B": "tencent/Hy-MT2-7B-GGUF",
+}
 
-def get_gguf_filename(variant: str) -> str:
-    return f"Hy-MT2-1.8B-{variant}.gguf"
+
+def get_gguf_filename(key: str) -> str:
+    """Get the filename from a variant key like '1.8B/Q4_K_M'."""
+    model_name, variant = key.split("/", 1)
+    return f"Hy-MT2-{model_name}-{variant}.gguf"
+
+
+def get_hf_repo_url(key: str) -> str:
+    """Get the HuggingFace repo URL from a variant key."""
+    model_name = key.split("/", 1)[0]
+    repo = HF_MODEL_REPO_URLS.get(model_name, HF_MODEL_REPO_URLS["1.8B"])
+    return f"{HF_URL_BASE}/{repo}/resolve/main/"
 
 
 # ── Language selector ──────────────────────────────────────
@@ -394,12 +392,21 @@ class TextPanel(QWidget):
         """)
 
 
+# ── Plain-text-only text edit ──────────────────────────────
+class PlainTextEdit(QTextEdit):
+    """QTextEdit subclass that strips ALL formatting on paste (Ctrl+V)."""
+
+    def insertFromMimeData(self, source: QMimeData) -> None:  # type: ignore[override]
+        # Only insert plain text, discard all rich text / HTML / formatting
+        self.setPlainText(source.text())
+
+
 # ── Input panel ────────────────────────────────────────────
 class InputPanel(TextPanel):
     """Left panel: paste/copy buttons + text input."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
-        text_edit = QTextEdit()
+        text_edit = PlainTextEdit()
         text_edit.setPlaceholderText("Nhập văn bản cần dịch...")
         paste_btn = QPushButton("⎘")
         paste_btn.setToolTip("Dán")
@@ -424,7 +431,7 @@ class OutputPanel(TextPanel):
     """Right panel: copy button + translated text."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
-        text_edit = QTextEdit()
+        text_edit = PlainTextEdit()
         text_edit.setPlaceholderText("Bản dịch sẽ hiển thị ở đây...")
         text_edit.setReadOnly(True)
         copy_btn = QPushButton("⧉")
@@ -440,6 +447,45 @@ class OutputPanel(TextPanel):
     @text.setter
     def text(self, value: str) -> None:
         self.text_edit.setPlainText(value)
+
+
+# ── Translation thread ─────────────────────────────────────
+class TranslateWorker(QThread):
+    """Translate text in background, streaming tokens."""
+
+    token = Signal(str)
+    finished = Signal(str)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        service: ModelService,
+        text: str,
+        source_lang: str,
+        target_lang: str,
+    ) -> None:
+        super().__init__()
+        self._service = service
+        self._text = text
+        self._source_lang = source_lang
+        self._target_lang = target_lang
+
+    def run(self) -> None:
+        try:
+            self._service.translate(
+                self._text,
+                self._source_lang,
+                self._target_lang,
+                on_token=lambda t: self.token.emit(t),
+                stream=True,
+            )
+            self.finished.emit("")  # Signal completion
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def abort(self) -> None:
+        self._aborted = True
+        self.quit()
 
 
 # ── Download thread ────────────────────────────────────────
@@ -603,7 +649,7 @@ class MainWindow(QMainWindow):
             }}
         """)
         self.translate_btn.setObjectName("translate")
-        self.translate_btn.clicked.connect(self.translate)
+        self.translate_btn.clicked.connect(self._on_translate_btn)
         top_layout.addWidget(self.translate_btn)
 
         main_layout.addWidget(top_bar)
@@ -781,33 +827,75 @@ class MainWindow(QMainWindow):
         cfg["last_target_lang"] = self.right_language_sel.selected_code()
         save_config(cfg)
 
+    def _on_translate_btn(self) -> None:
+        if self._is_translating:
+            self._on_cancel_translate()
+        else:
+            self.translate()
+
     # ── Translation ───────────────────────────────────────
+
+    def _on_translate_token(self, token: str) -> None:
+        """Append streaming token to output."""
+        cursor = self.right_panel.text_edit.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        cursor.insertText(token)
+        self.right_panel.text_edit.setTextCursor(cursor)
+
+    def _on_translate_done(self) -> None:
+        """Translation finished."""
+        self._is_translating = False
+        self.status_label.setText("Hoan thanh")
+        self.translate_btn.setText("▶")
+        self.translate_btn.setToolTip("Dich")
+
+    def _on_translate_error(self, err: str) -> None:
+        """Translation error."""
+        self._is_translating = False
+        self.status_label.setText(f"Lai: {err}")
+        self.translate_btn.setText("▶")
+        self.translate_btn.setToolTip("Dich")
+
+    def _on_cancel_translate(self) -> None:
+        """Cancel ongoing translation."""
+        if hasattr(self, "_translate_worker") and self._translate_worker.isRunning():
+            self._translate_worker.abort()
+            self._translate_worker.wait(1000)
+            self._is_translating = False
+            self.translate_btn.setText("▶")
+            self.translate_btn.setToolTip("Dich")
+            self.status_label.setText("Dã huy")
 
     def translate(self) -> None:
         text = self.left_panel.text
-        if not text.strip() or self._is_translating:
+        if not text.strip():
             return
         if not self._model_service.model:
             self.status_label.setText("Chua chon mo hinh. Nhan MENH MO HINH de tai.")
             return
 
-        self._is_translating = True
+        # Stop any previous translation
+        if hasattr(self, "_translate_worker") and self._translate_worker.isRunning():
+            self._translate_worker.abort()
+            self._translate_worker.wait(1000)
+
         source_lang = self.left_language_sel.selected_code()
         target_lang = self.right_language_sel.selected_code()
 
+        self._is_translating = True
         self.right_panel.text_edit.clear()
         self.status_label.setText("Dang dich...")
-        try:
-            result = self._model_service.translate(text, source_lang, target_lang)
-            if result:
-                self.right_panel.text = result
-                self.status_label.setText("Hoan thanh")
-            else:
-                self.status_label.setText("Khong co ket qua")
-        except Exception as e:
-            self.status_label.setText(f"Lai: {e}")
-        finally:
-            self._is_translating = False
+        self.translate_btn.setText("■")
+        self.translate_btn.setToolTip("Huy")
+
+        # Start background translation thread
+        self._translate_worker = TranslateWorker(
+            self._model_service, text, source_lang, target_lang
+        )
+        self._translate_worker.token.connect(self._on_translate_token)
+        self._translate_worker.finished.connect(self._on_translate_done)
+        self._translate_worker.error.connect(self._on_translate_error)
+        self._translate_worker.start()
 
     # ── Actions ───────────────────────────────────────────
 
@@ -916,7 +1004,8 @@ class MainWindow(QMainWindow):
             self._load_model_by_path(str(dest))
             return
 
-        url = f"{HF_URL_BASE}/{HF_REPO}/resolve/main/{filename}"
+        repo_url = get_hf_repo_url(variant)
+        url = f"{repo_url}{filename}"
         self.status_label.setText(f"Da tai {filename}...")
         self.model_combo.setEnabled(False)
 

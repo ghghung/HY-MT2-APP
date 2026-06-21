@@ -65,6 +65,8 @@ class ModelService:
         self.model = Llama(
             model_path=str(p),
             n_gpu_layers=-1,
+            n_ctx=8192,
+            n_batch=2048,
             verbose=False,
             lora_adapters=[],
         )
@@ -78,15 +80,17 @@ class ModelService:
         source_lang: str,
         target_lang: str,
         on_token: Optional[Callable[[str], None]] = None,
-    ) -> str:
-        """Translate text. Optionally stream tokens via *on_token*."""
+        *,
+        stream: bool = False,
+    ) -> str | None:
+        """Translate text. If *stream* is True, call *on_token(token)* for each token and return None.
+        If *stream* is False, return the full result string."""
         if self.model is None:
             raise RuntimeError("Model not loaded")
         if not text.strip():
             return ""
 
         # Convert lang code to label for the prompt
-        src_label = self.LANG_CODE_TO_LABEL.get(source_lang, source_lang)
         tgt_label = self.LANG_CODE_TO_LABEL.get(target_lang, target_lang)
 
         instruction = (
@@ -95,18 +99,40 @@ class ModelService:
             f"any additional explanation**:\n\n{text}"
         )
 
-        result = self.model(
-            instruction,
-            max_tokens=4096,
-            temperature=0.0,
-            echo=False,
-            stream=False,
-        )
+        if stream:
+            result = self.model(
+                instruction,
+                max_tokens=4096,
+                temperature=0.7,
+                top_p=0.6,
+                top_k=20,
+                repeat_penalty=1.05,
+                echo=False,
+                stream=True,
+            )
+            for chunk in result:
+                choices = chunk.get("choices", [])
+                if choices:
+                    text_delta = choices[0].get("text", "")
+                    if on_token:
+                        on_token(text_delta)
+            return None
+        else:
+            result = self.model(
+                instruction,
+                max_tokens=4096,
+                temperature=0.7,
+                top_p=0.6,
+                top_k=20,
+                repeat_penalty=1.05,
+                echo=False,
+                stream=False,
+            )
 
-        choices = result.get("choices", [])
-        if choices:
-            return choices[0].get("text", "")
-        return ""
+            choices = result.get("choices", [])
+            if choices:
+                return choices[0].get("text", "")
+            return ""
 
     # ── helpers ────────────────────────────────────────────
 
