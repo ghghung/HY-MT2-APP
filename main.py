@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtCore import QMimeData
 from PySide6.QtGui import QBrush, QColor, QFont, QPalette
-from PySide6.QtCore import Qt, QSize, QPoint, QTimer, QThread, Signal
+from PySide6.QtCore import Qt, QSize, QPoint, QTimer, QThread, Signal, QObject
 
 from model_service import ModelService
 
@@ -256,6 +256,8 @@ class LanguageSelector(QWidget):
         self._popup._search_edit.setFocus()
 
     def _on_selection(self, code: str) -> None:
+        if code == self._selected_code:
+            return  # prevent infinite loop if user re-selects same language
         self._selected_code = code
         self._update_display()
         self.selected.emit(code)
@@ -397,8 +399,16 @@ class PlainTextEdit(QTextEdit):
     """QTextEdit subclass that strips ALL formatting on paste (Ctrl+V)."""
 
     def insertFromMimeData(self, source: QMimeData) -> None:  # type: ignore[override]
-        # Only insert plain text, discard all rich text / HTML / formatting
-        self.setPlainText(source.text())
+        # Replace only selected text or insert at cursor position (like normal typing)
+        cursor = self.textCursor()
+        text = source.text()
+        if cursor.hasSelection():
+            cursor.insertText(text)
+        else:
+            # Append at cursor position
+            cursor.movePosition(cursor.MoveOperation.End)
+            cursor.insertText(text)
+        self.setTextCursor(cursor)
 
 
 # ── Input panel ────────────────────────────────────────────
@@ -463,12 +473,16 @@ class TranslateWorker(QThread):
         text: str,
         source_lang: str,
         target_lang: str,
+        abort_flag: list[bool],
+        seq: int,
     ) -> None:
         super().__init__()
         self._service = service
         self._text = text
         self._source_lang = source_lang
         self._target_lang = target_lang
+        self._abort_flag = abort_flag
+        self._seq = seq
 
     def run(self) -> None:
         try:
@@ -478,14 +492,15 @@ class TranslateWorker(QThread):
                 self._target_lang,
                 on_token=lambda t: self.token.emit(t),
                 stream=True,
+                abort_flag=self._abort_flag,
             )
-            self.finished.emit("")  # Signal completion
+            self.finished.emit(str(self._seq))
         except Exception as e:
             self.error.emit(str(e))
 
     def abort(self) -> None:
-        self._aborted = True
-        self.quit()
+        """Request the worker to abort by setting the shared abort flag."""
+        self._abort_flag[0] = True
 
 
 # ── Download thread ────────────────────────────────────────
@@ -547,10 +562,15 @@ class MainWindow(QMainWindow):
         self._model_service = ModelService()
         self._is_translating = False
         self._loading_state = True  # flag to prevent save during init
+        self._model_loading = False  # flag to prevent translation during model load/unload
+        self._swapping_languages = False  # flag to prevent cascade during swap
+        self._abort_flag = [False]  # mutable list so worker sees updates
+        self._translate_seq = 0  # monotonic counter, new worker gets next id
         self._apply_palette()
         self._build_ui()
         self._setup_auto_detect()
         self._setup_languages()
+        self._setup_idle_timer()
         self._loading_state = False  # enable save/swap after init
         self._load_last_model()
 
@@ -751,6 +771,29 @@ class MainWindow(QMainWindow):
         self._prev_char_count = 0
         self._prev_text = ""
 
+    def _setup_idle_timer(self) -> None:
+        """Idle timer: unload model after 3 minutes of no translation activity."""
+        self._idle_timer = QTimer()
+        self._idle_timer.setSingleShot(True)
+        self._idle_timer.setInterval(3 * 60 * 1000)  # 3 minutes
+        self._idle_timer.timeout.connect(self._on_idle_timeout)
+
+    def _reset_idle_timer(self) -> None:
+        """Restart the idle timer."""
+        self._idle_timer.stop()
+        self._idle_timer.start()
+
+    def _on_idle_timeout(self) -> None:
+        """Unload model to free GPU/CPU memory after idle period."""
+        if self._is_translating or getattr(self, "_model_loading", False):
+            return  # don't unload during active translation or load
+        if self._model_service.is_model_loaded():
+            self._model_loading = True
+            self._model_service.model = None  # free the model
+            self._model_loading = False
+            self.status_label.setText("Da tai mo hinh (idle 3p)")
+            self._update_model_combo()
+
     def _on_text_changed(self) -> None:
         if self._auto_detect_timer:
             self._auto_detect_timer.stop()
@@ -760,6 +803,8 @@ class MainWindow(QMainWindow):
         self._auto_translate_timer.start()
 
     def _do_auto_translate(self) -> None:
+        if getattr(self, "_swapping_languages", False):
+            return
         if self._is_translating or not self._model_service.model:
             return
         text = self.left_panel.text
@@ -805,23 +850,25 @@ class MainWindow(QMainWindow):
     # ── Language auto-swap ────────────────────────────────
 
     def _on_language_changed(self) -> None:
-        """If both panels end up with the same language, swap right panel."""
-        # Skip auto-swap during init (state is loading from config)
+        """If both panels end up with the same language, auto-swap right panel."""
+        # Skip during init or programmatic swap operation
         if getattr(self, "_loading_state", False):
+            return
+        if getattr(self, "_swapping_languages", False):
             return
 
         left_code = self.left_language_sel.selected_code()
         right_code = self.right_language_sel.selected_code()
 
-        if left_code != right_code:
-            return
+        # Only auto-correct when both sides accidentally match
+        if left_code == right_code:
+            all_codes = list(ModelService.LANG_CODE_TO_LABEL.keys())
+            for code in all_codes:
+                if code != left_code:
+                    self.right_language_sel.set_selected(code)
+                    break
 
-        all_codes = list(ModelService.LANG_CODE_TO_LABEL.keys())
-        for code in all_codes:
-            if code != left_code:
-                self.right_language_sel.set_selected(code)
-                break
-
+        # Persist language choices
         cfg = load_config()
         cfg["last_source_lang"] = self.left_language_sel.selected_code()
         cfg["last_target_lang"] = self.right_language_sel.selected_code()
@@ -836,15 +883,24 @@ class MainWindow(QMainWindow):
     # ── Translation ───────────────────────────────────────
 
     def _on_translate_token(self, token: str) -> None:
-        """Append streaming token to output."""
+        """Append streaming token to output. Only if this is still the current worker."""
+        worker = getattr(self, "_translate_worker", None)
+        if worker is None:
+            return
+        current_seq = worker._seq
+        if current_seq != self._translate_seq:
+            return  # stale worker, ignore its output
         cursor = self.right_panel.text_edit.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
         cursor.insertText(token)
         self.right_panel.text_edit.setTextCursor(cursor)
 
-    def _on_translate_done(self) -> None:
-        """Translation finished."""
+    def _on_translate_done(self, seq: str) -> None:
+        """Translation finished. Only process if this is the current worker."""
+        if int(seq) != self._translate_seq:
+            return  # stale worker, ignore
         self._is_translating = False
+        self._reset_idle_timer()
         self.status_label.setText("Hoan thanh")
         self.translate_btn.setText("▶")
         self.translate_btn.setToolTip("Dich")
@@ -858,39 +914,84 @@ class MainWindow(QMainWindow):
 
     def _on_cancel_translate(self) -> None:
         """Cancel ongoing translation."""
-        if hasattr(self, "_translate_worker") and self._translate_worker.isRunning():
-            self._translate_worker.abort()
-            self._translate_worker.wait(1000)
-            self._is_translating = False
-            self.translate_btn.setText("▶")
-            self.translate_btn.setToolTip("Dich")
-            self.status_label.setText("Dã huy")
+        worker = getattr(self, "_translate_worker", None)
+        if worker and worker.isRunning():
+            # Step 1: Disconnect signals IMMEDIATELY to prevent ghost tokens
+            try:
+                QObject.disconnect(worker.token, self._on_translate_token)
+            except TypeError:
+                pass
+            try:
+                QObject.disconnect(worker.finished, self._on_translate_done)
+            except TypeError:
+                pass
+            try:
+                QObject.disconnect(worker.error, self._on_translate_error)
+            except TypeError:
+                pass
+            # Step 2: Signal abort to the worker
+            self._abort_flag[0] = True
+            # Step 3: Wait for thread to finish safely
+            worker.wait(3000)
+            self._abort_flag[0] = False
+            # Step 4: Delete worker only after thread fully exited
+            worker.deleteLater()
+            # Clear reference immediately to prevent "already deleted" RuntimeError
+            self._translate_worker = None
+        self._is_translating = False
+        self.translate_btn.setText("▶")
+        self.translate_btn.setToolTip("Dich")
+        self.status_label.setText("Da huy")
 
     def translate(self) -> None:
         text = self.left_panel.text
         if not text.strip():
             return
+        # Don't start translation while model is being loaded/unloaded
+        if getattr(self, "_model_loading", False):
+            return
         if not self._model_service.model:
             self.status_label.setText("Chua chon mo hinh. Nhan MENH MO HINH de tai.")
             return
 
-        # Stop any previous translation
-        if hasattr(self, "_translate_worker") and self._translate_worker.isRunning():
-            self._translate_worker.abort()
-            self._translate_worker.wait(1000)
+        # Abort any in-progress translation properly
+        old_worker = getattr(self, "_translate_worker", None)
+        if old_worker is not None and old_worker.isRunning():
+            # Disconnect signals first to prevent ghost tokens from old worker
+            try:
+                QObject.disconnect(old_worker.token, self._on_translate_token)
+            except TypeError:
+                pass
+            try:
+                QObject.disconnect(old_worker.finished, self._on_translate_done)
+            except TypeError:
+                pass
+            try:
+                QObject.disconnect(old_worker.error, self._on_translate_error)
+            except TypeError:
+                pass
+            # Signal abort, then wait for clean exit
+            self._abort_flag[0] = True
+            old_worker.wait(3000)
+            self._abort_flag[0] = False
+            old_worker.deleteLater()
+            self._translate_worker = None
 
         source_lang = self.left_language_sel.selected_code()
         target_lang = self.right_language_sel.selected_code()
 
         self._is_translating = True
+        self._translate_seq += 1  # new worker gets a new ID
+        self._reset_idle_timer()
         self.right_panel.text_edit.clear()
         self.status_label.setText("Dang dich...")
         self.translate_btn.setText("■")
         self.translate_btn.setToolTip("Huy")
 
         # Start background translation thread
+        self._abort_flag[0] = False  # reset before creating new worker
         self._translate_worker = TranslateWorker(
-            self._model_service, text, source_lang, target_lang
+            self._model_service, text, source_lang, target_lang, self._abort_flag, self._translate_seq
         )
         self._translate_worker.token.connect(self._on_translate_token)
         self._translate_worker.finished.connect(self._on_translate_done)
@@ -905,21 +1006,43 @@ class MainWindow(QMainWindow):
         src_text = self.left_panel.text
         tgt_text = self.right_panel.text
 
+        # Stop auto-translate during swap
         if hasattr(self, '_auto_translate_timer'):
             self._auto_translate_timer.stop()
 
-        self.left_language_sel.set_selected(tgt_code)
-        self.right_language_sel.set_selected(src_code)
-        self.left_panel.text = tgt_text
-        self.right_panel.text = src_text
+        # Block all signals to prevent cascade textChanged/indexChanged events
+        self.left_language_sel.blockSignals(True)
+        self.right_language_sel.blockSignals(True)
+        self.left_panel.text_edit.blockSignals(True)
+        self.right_panel.text_edit.blockSignals(True)
 
+        self._swapping_languages = True
+        try:
+            # Swap languages
+            self.left_language_sel.set_selected(tgt_code)
+            self.right_language_sel.set_selected(src_code)
+            # Swap text
+            self.left_panel.text = tgt_text
+            self.right_panel.text = src_text
+        finally:
+            self._swapping_languages = False
+
+        # Re-enable signals
+        self.left_language_sel.blockSignals(False)
+        self.right_language_sel.blockSignals(False)
+        self.left_panel.text_edit.blockSignals(False)
+        self.right_panel.text_edit.blockSignals(False)
+
+        # Restart auto-detect for new text
         if hasattr(self, '_auto_detect_timer') and self._auto_detect_timer:
             self._auto_detect_timer.stop()
             self._auto_detect_timer.start()
 
-        if tgt_text.strip():
-            QTimer.singleShot(1500, self.translate)
+        # Single translation trigger — only if swapped text is non-empty
+        if tgt_text.strip() and self._model_service.is_model_loaded():
+            self.translate()
 
+        # Persist swap
         cfg = load_config()
         cfg["last_source_lang"] = src_code
         cfg["last_target_lang"] = tgt_code
@@ -1039,6 +1162,7 @@ class MainWindow(QMainWindow):
             self._load_model_by_path(path)
 
     def _load_model_by_path(self, path: str) -> None:
+        self._model_loading = True
         self.status_label.setText("Dang tai mo hinh...")
         self.model_combo.setEnabled(False)
         try:
@@ -1047,6 +1171,7 @@ class MainWindow(QMainWindow):
             cfg["last_model_path"] = path
             save_config(cfg)
             self.status_label.setText(f"Da tai: {Path(path).name}")
+            self._reset_idle_timer()
             self._update_model_combo()
             if self.left_panel.text.strip():
                 QTimer.singleShot(500, self.translate)
@@ -1054,6 +1179,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"Lai: {e}")
         finally:
             self.model_combo.setEnabled(True)
+            self._model_loading = False
 
     # ── Load last model ───────────────────────────────────
 
@@ -1064,6 +1190,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Dang tai lai mo hinh cu...")
             try:
                 self._model_service.load_model(last_path)
+                self._reset_idle_timer()
                 self.status_label.setText("Da tai mo hinh cu, san sang")
                 self._update_model_combo()
                 if self.left_panel.text.strip():
@@ -1074,10 +1201,32 @@ class MainWindow(QMainWindow):
     # ── Window close ────────────────────────────────────────
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        # Wait for download thread to finish before closing
-        if hasattr(self, "_download_worker") and self._download_worker.isRunning():
-            self._download_worker.abort()
-            self._download_worker.wait(3000)  # wait up to 3s
+        # Wait for translation worker to finish before closing
+        worker = getattr(self, "_translate_worker", None)
+        if worker is not None and worker.isRunning():
+            # Disconnect signals to prevent ghost tokens from hitting closed UI
+            try:
+                QObject.disconnect(worker.token, self._on_translate_token)
+            except TypeError:
+                pass
+            try:
+                QObject.disconnect(worker.finished, self._on_translate_done)
+            except TypeError:
+                pass
+            try:
+                QObject.disconnect(worker.error, self._on_translate_error)
+            except TypeError:
+                pass
+            self._abort_flag[0] = True
+            worker.wait(3000)
+            self._abort_flag[0] = False
+            worker.deleteLater()
+            self._translate_worker = None
+        # Wait for download worker to finish before closing
+        downloader = getattr(self, "_download_worker", None)
+        if downloader is not None and downloader.isRunning():
+            downloader.abort()
+            downloader.wait(3000)  # wait up to 3s
         super().closeEvent(event)
 
 
